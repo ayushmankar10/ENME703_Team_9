@@ -3,7 +3,7 @@ from glob import glob
 
 from setuptools import find_packages, setup
 
-package_name = 'localization_server_TEAM_X'
+package_name = 'localization_server_TEAM_9'
 
 setup(
     name=package_name,

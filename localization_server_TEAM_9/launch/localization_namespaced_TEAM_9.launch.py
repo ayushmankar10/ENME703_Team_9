@@ -13,30 +13,30 @@ def launch_setup(context):
 
     robot_namespace = LaunchConfiguration("namespace").perform(context)
 
-    nav2_yaml = os.path.join(get_package_share_directory("localization_server"),"config",f"{robot_namespace}_amcl_config.yaml")
+    nav2_yaml = os.path.join(get_package_share_directory("localization_server_TEAM_9"),"config",f"{robot_namespace}_amcl_config.yaml")
    
     return [
 
         Node(
-            ........, # your namespace
-            package=........
-            executable=........,
-            name=........,
-            output=........,
-            parameters=[........]
+            namespace=robot_namespace, # your namespace
+            package="nav2_amcl",
+            executable="amcl",
+            name="amcl",
+            output="screen",
+            parameters=[nav2_yaml]
         ),
 
         Node(
-            ........, # your namespace
-            package=........,
-            executable=........,
-            name=........,
-            output=........,
+            namespace=robot_namespace, # your namespace
+            package="nav2_lifecycle_manager",
+            executable="lifecycle_manager",
+            name="lifecycle_manager_localization",
+            output="screen",
             parameters=[
                 {"use_sim_time": False},
                 {"autostart": True},
                 {"bond_timeout": 0.0},
-                {"node_names": [........]}
+                {"node_names": ["amcl"]}
             ]
         )
     ]
@@ -48,7 +48,7 @@ def generate_launch_description():
 
         DeclareLaunchArgument(
             "namespace",
-            default_value=" ",
+            default_value="",
             description="Robot namespace"
         ),
 
