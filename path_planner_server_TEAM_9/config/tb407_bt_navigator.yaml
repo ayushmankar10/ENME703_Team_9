@@ -4,7 +4,7 @@ tb407/bt_navigator:
     navigators: ["navigate_to_pose"]
 
     navigate_to_pose:
-      plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
+      plugin: "nav2_bt_navigator/NavigateToPoseNavigator"
 
     enable_stamped_cmd_vel: true
     global_frame: map
