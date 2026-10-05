@@ -8,7 +8,7 @@ tb409/controller_server:
     min_theta_velocity_threshold: 0.001
     transform_tolerance: 1.0
     failure_tolerance: 0.3
-    progress_checker_plugin: ["progress_checker"]
+    progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["general_goal_checker"] 
     controller_plugins: ["FollowPath"]
     use_realtime_priority: false
