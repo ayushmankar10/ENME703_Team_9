@@ -5,7 +5,7 @@ tb402/amcl:
     alpha2: 0.2
     alpha3: 0.2
     alpha4: 0.2
-    alpha5: 0.2
+    alpha5: 0.3
     base_frame_id: "tb402/base_link"
     beam_skip_distance: 0.5
     beam_skip_error_threshold: 0.9
