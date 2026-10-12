@@ -3,9 +3,16 @@
 <package format="3">
   <name>localization_server_TEAM_9</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="user@todo.todo">user</maintainer>
+  <description>Namespaced AMCL localization for Team 9 TurtleBot 4 robots.</description>
+  <maintainer email="karayushman963@gmail.com">Ayushman Kar</maintainer>
   <license>TODO: License declaration</license>
+
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>nav2_amcl</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
