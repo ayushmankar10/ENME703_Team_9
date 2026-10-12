@@ -1,374 +1,578 @@
 #!/usr/bin/env python3
 
 import math
-import rclpy
-import numpy as np
-import time
+from collections import deque
 
-from rclpy.node import Node
-from rclpy.action import ActionClient
-from nav2_msgs.action import NavigateToPose 
+import rclpy  # pyright: ignore[reportMissingImports]
+from rclpy.action import ActionClient  # pyright: ignore[reportMissingImports]
+from rclpy.node import Node  # pyright: ignore[reportMissingImports]
+from rclpy.qos import qos_profile_sensor_data  # pyright: ignore[reportMissingImports]
+from rclpy.time import Time  # pyright: ignore[reportMissingImports]
+from rclpy.executors import ExternalShutdownException  # pyright: ignore[reportMissingImports]
 
-from tf2_ros import Buffer, TransformListener
-from tf_transformations import quaternion_from_euler, euler_from_quaternion
-from tf2_ros import TransformBroadcaster
-from geometry_msgs.msg import TransformStamped
-from scipy.spatial.transform import Rotation as R
+from action_msgs.msg import GoalStatus  # pyright: ignore[reportMissingImports]
+from geometry_msgs.msg import TransformStamped  # pyright: ignore[reportMissingImports]
+from nav2_msgs.action import NavigateToPose  # pyright: ignore[reportMissingImports]
+from sensor_msgs.msg import CompressedImage  # pyright: ignore[reportMissingImports]
+from tf2_ros import Buffer, TransformListener, TransformBroadcaster, TransformException  # pyright: ignore[reportMissingImports]
 
-from geometry_msgs.msg import PoseStamped
-from sensor_msgs.msg import CompressedImage, Image
-from nav_msgs.msg import Odometry
-from action_msgs.msg import GoalStatus
-
-from .... import ...  # To put your custom msg package and file
+from tracker_interfaces_team_9.msg import TrackerReport  # pyright: ignore[reportMissingImports]
 
 
-
-'''
--   This node should be launch from your own Package called "tracker_TEAM_X" (X is your team number.)
--   Your launch file should accept 3 arguments:
-        - chaser            # e.g., tb402
-        - enemy             # e.g., tb407
-        - global_frame      # map
--   launch file naming format: tracker_two_tb4_TEAM_X.launch.py
--   Python file naming format: tracker_two_tb4_TEAM_X.py
-'''
-
-'''
-For your custom message, follow the naming and data type as follow.
-Note: *** you should not forget the message header. ***
-
-Custom message name: TrackerReport.msg
-
--Data Type                       Name                Comment                        
-
- sensor_msgs/CompressedImage    image               # the opponent's photo
- uint8                          my_id               # my own ID (e.g., 1) if you are tb401
- uint8                          opp_id              # my opponent ID (e.g., 9) if your enemy is tb409
- float32                        rel_dist            # normed distance of your opponent w.r.t. your frame
- float32                        rel_orient          # orientation (yaw) of your opponent w.r.t. your frame
-'''
+def wrap_angle(angle):
+    """Keep an angle between -pi and pi."""
+    return math.atan2(math.sin(angle), math.cos(angle))
 
 
-'''
-This is just a general guideline. If you want to write in your own fashion, you can do so as long as it serves the purpose.
-'''
+def quaternion_yaw(q):
+    """Extract yaw in radians from a quaternion."""
+    return math.atan2(
+        2.0 * (q.w * q.z + q.x * q.y),
+        1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+    )
+
+
+def robot_id(namespace):
+    """Convert tb402 to ID 2, tb407 to ID 7, etc."""
+    if not namespace.startswith("tb") or not namespace[2:].isdigit():
+        raise ValueError("Robot names must look like tb402 or tb407")
+
+    value = int(namespace[2:]) - 400
+
+    if not 1 <= value <= 255:
+        raise ValueError("Robot ID must fit uint8: tb401 maps to ID 1")
+
+    return value
 
 
 class TrackerTwoTB4(Node):
-
     def __init__(self):
+        super().__init__("tracker_two_tb4")
 
-        super().__init__('tracker_two_tb4')
+        defaults = {
+            "chaser": "tb402",
+            "enemy": "tb407",
+            "global_frame": "map",
+            "enemy_offset": 0.5,
+            "enemy_fov": 80.0,
+            "enemy_fov_offset": 30.0,
+            "capture_cooldown": 5.0,
+            "capture_distance_tolerance": 0.25,
+        }
 
-        '''
-        The following 3 parameters should be received as the arguments in launch file.
-        Those arguments in the launch file should be passed to this node.
-        '''
+        for name, value in defaults.items():
+            self.declare_parameter(name, value)
 
-        self.declare_parameter('chaser')   # e.g., tb402       
-        self.declare_parameter('enemy')    # e.g., tb407      
-        self.declare_parameter('global_frame') # map
+        self.chaser = str(
+            self.get_parameter("chaser").value
+        ).strip("/")
 
+        self.enemy = str(
+            self.get_parameter("enemy").value
+        ).strip("/")
 
-        self.chaser = self.get_parameter('chaser').value
-        self.enemy= self.get_parameter('enemy').value
-        self.global_frame = self.get_parameter('global_frame').value
+        self.global_frame = str(
+            self.get_parameter("global_frame").value
+        ).strip("/")
 
-        enemy_odom_topic = self.enemy + '/odom'
-        chaser_odom_topic = self.chaser + '/odom'
-        nav_action = self.chaser + '/navigate_to_pose'
+        self.my_id = robot_id(self.chaser)
+        self.opp_id = robot_id(self.enemy)
 
-        self.H = np.eye(4)  # Use it if you need in constructing your goal_pose
+        if self.chaser == self.enemy or not self.global_frame:
+            raise ValueError(
+                "Use different robots and a non-empty global_frame"
+            )
 
-        '''
-        The following 3 parameters will be given to you once the final map is constructed.
-        As for you now, you can assign some values.
-        '''
+        self.enemy_offset = float(
+            self.get_parameter("enemy_offset").value
+        )
 
-        self.enemy_offset = ...        # e.g., 0.7 [m]
-        self.enemy_fov = ...           # e.g., 40  [deg]. You may need conversion to rad. It really depends on your own program.
-        self.enemy_fov_offset = ...    # e.g., 20  [deg]. You may need conversion to rad. It really depends on your own program.
+        fov = float(self.get_parameter("enemy_fov").value)
+        buffer = float(self.get_parameter("enemy_fov_offset").value)
 
-        self.last_goal_x = 0.0   #[m]
-        self.last_goal_y = 0.0   #[m]
-        self.last_goal_yaw = 0.0 #[rad]
-        self.rel_dist_enemy_in_chaser  = 0.0    # [m]
-        self.rel_orient_enemy_in_chaser = 0.0   # [deg] (Not to forget conversion from rad to deg). It is easier to check/troubleshoot in deg.
+        # Excluded region is centred on the opponent's forward direction.
+        self.exclusion_angle = math.radians(fov / 2.0 + buffer)
+        self.camera_half_fov = math.radians(fov / 2.0)
 
-        self.goal_handle = None
-        self.pending_goal = False
+        self.cooldown = float(
+            self.get_parameter("capture_cooldown").value
+        )
 
-        self.chaser_base = self.chaser + '/base_link'
-        self.enemy_base = self.enemy + '/base_link'
-        
-        self.tracker_image_sub =  self.create_subscription(
-                                                    .........., # Put the compatible message type
-                                                    '/'+self.chaser+'/oakd/rgb/preview/image_raw/compressed',
-                                                    self.tracker_image_callback,
-                                                    10
-                                                )
+        self.distance_tolerance = float(
+            self.get_parameter("capture_distance_tolerance").value
+        )
 
-        self.tracker_report_pub = self.create_publisher( ... , # To put your custom msg
-                                                        '/'+self.chaser+'/tracker_report',10) # Don't change the topic name
+        if not (
+            self.enemy_offset > 0.0
+            and 0.0 < fov < 360.0
+            and buffer >= 0.0
+            and self.exclusion_angle < math.pi
+            and self.cooldown >= 5.0
+            and 0.0 < self.distance_tolerance < self.enemy_offset
+        ):
+            raise ValueError(
+                "Invalid tracker geometry or cooldown parameters"
+            )
 
-        # Although '/'+self.chaser+'/tracker_report' has image data. It cannot be directly used in RViz. In addition to your custom message, publish it separately as well.
-        self.tracker_report_img_pub = self.create_publisher(CompressedImage,
-                                                            '/'+self.chaser+'/tracker_report_img/compressed',10) # compressed is necessary as a part of topic (Dont change the topic name)
+        self.chaser_base = f"{self.chaser}/base_link"
+        self.enemy_base = f"{self.enemy}/base_link"
 
- 
-        self.tracker_image = None
-       
-        # tf 
-        self.tf_buffer = Buffer()
-        self.tf_listener = ... (self.tf_buffer, self)   # To use TransformListener
-        self.tf_broadcaster = ... (self)                # To use TransformBroadcaster
-      
+        # Keep recent images so TF can catch up to their timestamps.
+        self.images = deque(maxlen=30)
+
+        self.tf_buffer = Buffer(node=self)
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_broadcaster = TransformBroadcaster(self)
+
+        self.image_sub = self.create_subscription(
+            CompressedImage,
+            f"/{self.chaser}/oakd/rgb/preview/image_raw/compressed",
+            self.tracker_image_callback,
+            qos_profile_sensor_data,
+        )
+
+        self.report_pub = self.create_publisher(
+            TrackerReport,
+            f"/{self.chaser}/tracker_report",
+            10,
+        )
+
+        self.report_image_pub = self.create_publisher(
+            CompressedImage,
+            f"/{self.chaser}/tracker_report_img/compressed",
+            10,
+        )
+
         self.nav_client = ActionClient(
             self,
             NavigateToPose,
-            nav_action
+            f"/{self.chaser}/navigate_to_pose",
         )
 
-        self.timer = self.create_timer(0.2, self.update_goal) # 20 Hz
-        self.get_logger().info("Tracker Two TB4 initialized")
+        self.goal_handle = None
+        self.pending_goal = False
+        self.cancel_pending = False
+        self.goal_succeeded = False
 
-    def tracker_image_callback(self,msg):
+        self.success_time = float("inf")
+        self.last_goal = None
+        self.last_send_time = float("-inf")
+        self.last_report_time = float("-inf")
 
-        self.tracker_image = ... # To pass the image 
+        self.alternative_side = 1.0
+        self.use_alternative = False
 
+        self.timer = self.create_timer(0.2, self.update_goal)  # 5 Hz
 
-    def homogeneous_T(self,pos,yaw):
-        '''
-        If you need homogeneous transformation (4x4) matrix. You may refer to the lecture slides. 
-        You can approach us if you could not identify it in the lecture slides.
-        '''
+        self.get_logger().info(
+            f"Tracking {self.enemy} with {self.chaser}"
+        )
 
-        H = np.eye(4)
-        c_yaw = np.cos(yaw)
-        s_yaw = np.sin(yaw)
+    def now_seconds(self):
+        return self.get_clock().now().nanoseconds / 1e9
 
-        # Complete the H matrix.
-        H[0:2,0:2]= np.array([[..., ...],
-                              [..., ...]])
-        H[0:3,3] = ...
+    def tracker_image_callback(self, msg):
+        self.images.append(msg)
 
-        return H
+    def world_pose(self, frame):
+        """Return a robot's x, y and yaw in the global frame."""
+        tf = self.tf_buffer.lookup_transform(
+            self.global_frame,
+            frame,
+            Time(),
+        )
 
+        stamp = Time.from_msg(tf.header.stamp).nanoseconds / 1e9
 
-    def sign(self,k):
-        '''
-        You may use it if you need it.
-        '''
-        if k < 0:
-            return -1
-        else:
-            return 1
+        if stamp != 0.0:
+            age = self.now_seconds() - stamp
 
+            if not -0.1 <= age <= 1.0:
+                raise ValueError(f"Stale TF for {frame}")
+
+        position = tf.transform.translation
+
+        pose = (
+            position.x,
+            position.y,
+            quaternion_yaw(tf.transform.rotation),
+        )
+
+        if not all(math.isfinite(value) for value in pose):
+            raise ValueError(f"Invalid TF for {frame}")
+
+        return pose
+
+    def desired_pose(self, enemy_pose, chaser_pose):
+        """Choose an allowed position facing the opponent."""
+        ex, ey, enemy_yaw = enemy_pose
+        cx, cy, _ = chaser_pose
+
+        dx = cx - ex
+        dy = cy - ey
+
+        distance = math.hypot(dx, dy)
+        angle = wrap_angle(
+            math.atan2(dy, dx) - enemy_yaw
+        )
+
+        outside_fov = abs(angle) > self.exclusion_angle
+
+        if (
+            outside_fov
+            and abs(distance - self.enemy_offset)
+            <= self.distance_tolerance
+        ):
+            # At capture distance: hold position and face the opponent.
+            return cx, cy, math.atan2(ey - cy, ex - cx)
+
+        if self.use_alternative:
+            angle = self.alternative_side * min(
+                math.pi,
+                self.exclusion_angle + math.radians(15.0),
+            )
+
+        elif not outside_fov:
+            side = 1.0 if angle >= 0.0 else -1.0
+
+            angle = side * min(
+                math.pi,
+                self.exclusion_angle + math.radians(10.0),
+            )
+
+        gx = ex + self.enemy_offset * math.cos(enemy_yaw + angle)
+        gy = ey + self.enemy_offset * math.sin(enemy_yaw + angle)
+
+        goal_yaw = math.atan2(ey - gy, ex - gx)
+
+        return gx, gy, goal_yaw
+
+    def broadcast_goal(self, goal):
+        """Publish the desired pose as a TF frame for inspection."""
+        x, y, yaw = goal
+
+        tf = TransformStamped()
+        tf.header.stamp = self.get_clock().now().to_msg()
+        tf.header.frame_id = self.global_frame
+        tf.child_frame_id = f"{self.chaser}/tracker_goal"
+
+        tf.transform.translation.x = float(x)
+        tf.transform.translation.y = float(y)
+
+        tf.transform.rotation.z = math.sin(yaw / 2.0)
+        tf.transform.rotation.w = math.cos(yaw / 2.0)
+
+        self.tf_broadcaster.sendTransform(tf)
 
     def update_goal(self):
-        '''
-        This method is to update the goal if required.
-        '''
-
         try:
-            # Use tf lookup transform to get enemy pose in global_frame
-            enemy_tf = ...........
+            enemy_pose = self.world_pose(self.enemy_base)
+            chaser_pose = self.world_pose(self.chaser_base)
 
-        except Exception as e:
-            self.get_logger().warn(f"Enemy TF failed: {e}")
-            return
-        
-        try:
-            #  Use tf lookup transform to get enemy pose in chaser frame
-            rel_tf_enemy_in_chaser =  ..............
+        except (TransformException, ValueError) as error:
+            self.goal_succeeded = False
+            self.cancel_current_goal()
 
-        except Exception as e:
-            self.get_logger().warn(f"Relative TF failed: {e}")
+            self.get_logger().warning(
+                f"Waiting for valid TF: {error}",
+                throttle_duration_sec=2.0,
+            )
             return
 
-        try:
-            # Use tf lookup transform to get chaser in enemy frame
-            rel_tf_chaser_in_enemy = ...............
+        goal = self.desired_pose(enemy_pose, chaser_pose)
 
-        except Exception as e:
-            self.get_logger().warn(f"Relative TF failed: {e}")
+        self.broadcast_goal(goal)
+        self.publish_report_if_ready()
+
+        if self.pending_goal or self.cancel_pending:
             return
 
-        
-
-        enemy_x = enemy_tf.transform.translation.x
-        enemy_y = enemy_tf.transform.translation.y
-
-        # get relative x and y of enemy in chaser frame
-        rel_x_enemy_in_chaser = ........
-        rel_y_enemy_in_chaser = ........
-
-        # get relative quaternion of enemy in chaser frame
-        rel_q_enemy_in_chaser = ..............
-
-        # Convert from quaternion to Euler angle (yaw angle)
-        _, _, rel_yaw_enemy_in_chaser = euler_from_quaternion([rel_q_enemy_in_chaser.x,
-                                                               rel_q_enemy_in_chaser.y, 
-                                                               rel_q_enemy_in_chaser.z, 
-                                                               rel_q_enemy_in_chaser.w])
-
-        # Calculate rel_dist and rel_orient which are parts of your custom message.
-        self.rel_dist_enemy_in_chaser   = .......                                                    
-        self.rel_orient_enemy_in_chaser = .......
-
-        
-        
-
-        # get relative x and y of chaser in enemy frame
-        rel_x_chaser_in_enemy = ............
-        rel_y_chaser_in_enemy = ............
-        
-
-        
-
-        # To check if the goal (x,y) is in enemy field of view (FOV)
-        if ...........................................................: # write your "if" statement if your  
-            self.get_logger().warn("In Enemy FOV....")
-            # It will be important for you to know if you are in enemy FOV.
-            # If so, you might want to take some actions (: not referring to ROS action)
-
-        # This H_enemy_in_map might be useful if you want to map anything from enemy to map
-        H_enemy_in_map = self.homogeneous_T(np.array([enemy_x,enemy_y,0]),yaw)
-
-        '''
-            Use maths to decide your goal pose (x_d, y_d, theta_d).
-            H_d_in_map is the homogeneous transformation which has all information from desired_frame (goal frame) to map frame
-        '''
-       
-        H_d_in_map = H_enemy_in_map @ ................... # @ is a symbol for multiplication
-
-
-        '''
-         From H_d_in_map, you can extract goal_yaw using the following approach. How about goal_x and goal_y?
-        '''
-        R_d_in_map = R.from_matrix(H_d_in_map[0:3,0:3]) 
-        _, _,  goal_yaw = R_d_in_map.as_euler('xyz', degrees=False)
-
-        # To calculate relative distance between the enemy and goal
-        rel_dist_bet_enemy_and_goal = math.sqrt((enemy_x- goal_x)**2 + (enemy_y - goal_y)**2)
-
-        '''
-        You might want to check if your enemy is far from you or out of sight.
-        If so, you might want to send the latest goal.
-        If not, you might want to keep the same goal (last goal).
-        '''
-        if ...................................................................: # Write your "if" statement
-            goal_x   = goal_x
-            goal_y   = goal_y
-            goal_yaw = goal_yaw
-            self.send_goal(goal_x, goal_y, goal_yaw)
-        else:
-            
-            goal_x   = self.last_goal_x   
-            goal_y   = self.last_goal_y  
-            goal_yaw = self.last_goal_yaw
-
-    
-
-        self.last_goal_x   = goal_x
-        self.last_goal_y   = goal_y
-        self.last_goal_yaw = goal_yaw
-
-
-       # Using TF broacaster, publish your goal_pose so that it is easier for you to check if your maths is correct.
-
-   
-
-    def send_goal(self, x, y, yaw):
-
-        if not self.nav_client.wait_for_server(timeout_sec=1.0):
-            self.get_logger().warn("Nav2 action server not available")
+        # Limit goal changes to at most once per second.
+        if self.now_seconds() - self.last_send_time < 1.0:
             return
+
+        changed = self.last_goal is None
+
+        if self.last_goal is not None:
+            lx, ly, lyaw = self.last_goal
+
+            changed = (
+                math.hypot(goal[0] - lx, goal[1] - ly) > 0.15
+                or abs(wrap_angle(goal[2] - lyaw)) > 0.2
+            )
+
+        if self.goal_handle is not None:
+            if changed:
+                self.cancel_current_goal()
+            return
+
+        if changed or not self.goal_succeeded:
+            self.send_goal(goal)
+
+    def send_goal(self, goal):
+        if not self.nav_client.server_is_ready():
+            self.get_logger().warning(
+                "Waiting for Nav2 action server",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        x, y, yaw = goal
+
+        msg = NavigateToPose.Goal()
+        msg.pose.header.frame_id = self.global_frame
+        msg.pose.header.stamp = self.get_clock().now().to_msg()
+
+        msg.pose.pose.position.x = float(x)
+        msg.pose.pose.position.y = float(y)
+
+        msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
         self.pending_goal = True
+        self.goal_succeeded = False
+        self.last_send_time = self.now_seconds()
 
-        goal_msg = NavigateToPose.Goal()
+        try:
+            future = self.nav_client.send_goal_async(msg)
 
-        # Write your goal_msg
-        ......
-        ......
-        ....
+            future.add_done_callback(
+                lambda result: self.goal_response_callback(result, goal)
+            )
 
-        self.get_logger().info(f"Sending goal: ({x:.2f}, {y:.2f}, {yaw:.2f})")
-
-        future = self.nav_client.send_goal_async(goal_msg)
-        future.add_done_callback(self.goal_response_callback)
-
-
-    def goal_response_callback(self, future):
-
-        goal_handle = future.result()
-
-        if not goal_handle.accepted:
-            self.get_logger().warn("Goal rejected")
+        except Exception as error:
             self.pending_goal = False
+            self.get_logger().error(
+                f"Could not send goal: {error}"
+            )
+
+    def goal_response_callback(self, future, goal):
+        self.pending_goal = False
+
+        try:
+            handle = future.result()
+
+            if handle is None or not handle.accepted:
+                self.get_logger().warning("Nav2 rejected the goal")
+                return
+
+            self.goal_handle = handle
+            self.last_goal = goal
+
+            result = handle.get_result_async()
+
+            result.add_done_callback(
+                lambda done: self.goal_result_callback(done, handle)
+            )
+
+        except Exception as error:
+            self.get_logger().error(
+                f"Goal response failed: {error}"
+            )
+
+    def cancel_current_goal(self):
+        if self.goal_handle is None or self.cancel_pending:
             return
 
-        self.get_logger().info("Goal accepted")
+        self.cancel_pending = True
+        self.goal_succeeded = False
 
-        self.goal_handle = goal_handle
+        try:
+            future = self.goal_handle.cancel_goal_async()
+            handle = self.goal_handle
 
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self.goal_result_callback)
+            future.add_done_callback(
+                lambda done: self.cancel_response_callback(done, handle)
+            )
 
+        except Exception as error:
+            self.cancel_pending = False
+            self.get_logger().error(
+                f"Cancellation request failed: {error}"
+            )
 
-    def goal_result_callback(self, future):
+    def cancel_response_callback(self, future, handle):
+        if handle is not self.goal_handle:
+            return
 
-       
-        if self.pending_goal is True:
+        try:
+            response = future.result()
+
+            if response is None or not response.goals_canceling:
+                self.cancel_pending = False
+
+                self.get_logger().warning(
+                    "Cancellation not accepted; waiting for goal result"
+                )
+
+        except Exception as error:
+            self.cancel_pending = False
+            self.get_logger().error(
+                f"Cancellation response failed: {error}"
+            )
+
+    def goal_result_callback(self, future, handle):
+        # Ignore a result belonging to an older goal.
+        if handle is not self.goal_handle:
+            return
+
+        self.goal_handle = None
+        self.cancel_pending = False
+
+        try:
             result = future.result()
             status = result.status
 
-        if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info("Goal succeeded")
-            if self.tracker_image is None:
-                self.get_logger().info("Goal succeeded but No Image Available.")
-                return
-            
-            # When your goal is successful, you need to update your custom message
-            ..................
-            ................
-            ...................
-            .................
+        except Exception as error:
+            self.goal_succeeded = False
+            self.get_logger().error(
+                f"Goal result failed: {error}"
+            )
+            return
 
+        self.goal_succeeded = status == GoalStatus.STATUS_SUCCEEDED
 
+        if self.goal_succeeded:
+            self.success_time = self.now_seconds()
+            self.use_alternative = False
 
-            self.tracker_report_pub.publish(.................) # after the update, do not forget to publish it.
-
-
-
-            # Similarly, you should publish the enemy photo separately. 
-           
-            self.tracker_report_img_pub.publish(.........)
-
+            self.get_logger().info(
+                "Goal reached; waiting for a valid capture image"
+            )
 
         elif status == GoalStatus.STATUS_ABORTED:
-            self.get_logger().warn("Goal aborted → sending alternative route")
-          
-            
+            self.alternative_side *= -1.0
+            self.use_alternative = True
+
+            self.get_logger().warning(
+                "Goal aborted; trying another allowed position"
+            )
 
         elif status == GoalStatus.STATUS_CANCELED:
-            self.get_logger().warn("Goal canceled → sending alternative route")
-          
+            self.get_logger().info(
+                "Old goal cancelled; updating target"
+            )
 
         else:
-            self.get_logger().warn(f"Unknown status: {status}")
-           
+            self.get_logger().warning(
+                f"Goal finished with status {status}"
+            )
+
+    def publish_report_if_ready(self):
+        now = self.now_seconds()
+
+        if not self.goal_succeeded:
+            return
+
+        if now - self.last_report_time < self.cooldown:
+            return
+
+        for image in reversed(self.images):
+            stamp = Time.from_msg(image.header.stamp)
+            image_time = stamp.nanoseconds / 1e9
+
+            # Use a fresh image taken after the navigation goal succeeded.
+            if image_time <= 0.0 or image_time < self.success_time:
+                continue
+
+            if not 0.0 <= now - image_time <= 1.0:
+                continue
+
+            if not image.data:
+                continue
+
+            try:
+                enemy_tf = self.tf_buffer.lookup_transform(
+                    self.chaser_base,
+                    self.enemy_base,
+                    stamp,
+                )
+
+                chaser_tf = self.tf_buffer.lookup_transform(
+                    self.enemy_base,
+                    self.chaser_base,
+                    stamp,
+                )
+
+            except TransformException:
+                continue
+
+            relative = enemy_tf.transform.translation
+            reverse = chaser_tf.transform.translation
+
+            distance = math.hypot(relative.x, relative.y)
+            bearing = math.atan2(relative.y, relative.x)
+            enemy_bearing = math.atan2(reverse.y, reverse.x)
+
+            if (
+                abs(distance - self.enemy_offset)
+                > self.distance_tolerance
+            ):
+                continue
+
+            # Reject capture from inside the opponent's excluded region.
+            if abs(enemy_bearing) <= self.exclusion_angle:
+                continue
+
+            # The opponent must be in front of the chaser's camera.
+            if abs(bearing) > self.camera_half_fov:
+                continue
+
+            report = TrackerReport()
+
+            report.header.stamp = image.header.stamp
+            report.header.frame_id = self.chaser_base
+            report.image = image
+
+            report.my_id = self.my_id
+            report.opp_id = self.opp_id
+            report.rel_dist = float(distance)
+
+            report.rel_orient = float(
+                math.degrees(
+                    quaternion_yaw(enemy_tf.transform.rotation)
+                )
+            )
+
+            self.report_pub.publish(report)
+            self.report_image_pub.publish(image)
+
+            self.last_report_time = now
+
+            self.get_logger().info(
+                f"Published report: opponent {self.opp_id}, "
+                f"distance {distance:.2f} m"
+            )
+            return
 
 
-def main():
-    rclpy.init()
-    node = TrackerTwoTB4()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+def main(args=None):
+    rclpy.init(args=args)
+    node = None
+
+    try:
+        node = TrackerTwoTB4()
+        rclpy.spin(node)
+
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+
+    finally:
+        if node is not None:
+            if rclpy.ok() and node.goal_handle is not None:
+                future = node.goal_handle.cancel_goal_async()
+
+                rclpy.spin_until_future_complete(
+                    node,
+                    future,
+                    timeout_sec=1.0,
+                )
+
+            node.destroy_node()
+
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
