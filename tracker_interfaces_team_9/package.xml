@@ -3,7 +3,7 @@
   <name>tracker_interfaces_team_9</name>
   <version>0.0.0</version>
   <description>Custom tracker report message for Team 9.</description>
-  <maintainer email="user@todo.todo">user</maintainer>
+  <maintainer email="karayushman963@gmail.com">Ayushman Kar</maintainer>
   <license>TODO: License declaration</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
