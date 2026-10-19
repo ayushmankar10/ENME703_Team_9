@@ -1,0 +1,13 @@
+[1mdiff --git a/tracker_interfaces_team_9/package.xml b/tracker_interfaces_team_9/package.xml[m
+[1mindex 559b4bd..6b273c8 100644[m
+[1m--- a/tracker_interfaces_team_9/package.xml[m
+[1m+++ b/tracker_interfaces_team_9/package.xml[m
+[36m@@ -3,7 +3,7 @@[m
+   <name>tracker_interfaces_team_9</name>[m
+   <version>0.0.0</version>[m
+   <description>Custom tracker report message for Team 9.</description>[m
+[31m-  <maintainer email="user@todo.todo">user</maintainer>[m
+[32m+[m[32m  <maintainer email="karayushman963@gmail.com">Ayushman Kar</maintainer>[m
+   <license>TODO: License declaration</license>[m
+ [m
+   <buildtool_depend>ament_cmake</buildtool_depend>[m
