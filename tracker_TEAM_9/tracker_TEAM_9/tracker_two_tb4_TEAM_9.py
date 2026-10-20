@@ -3,20 +3,20 @@
 import math
 from collections import deque
 
-import rclpy  # pyright: ignore[reportMissingImports]
-from rclpy.action import ActionClient  # pyright: ignore[reportMissingImports]
-from rclpy.node import Node  # pyright: ignore[reportMissingImports]
-from rclpy.qos import qos_profile_sensor_data  # pyright: ignore[reportMissingImports]
-from rclpy.time import Time  # pyright: ignore[reportMissingImports]
-from rclpy.executors import ExternalShutdownException  # pyright: ignore[reportMissingImports]
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
+from rclpy.executors import ExternalShutdownException
 
-from action_msgs.msg import GoalStatus  # pyright: ignore[reportMissingImports]
-from geometry_msgs.msg import TransformStamped  # pyright: ignore[reportMissingImports]
-from nav2_msgs.action import NavigateToPose  # pyright: ignore[reportMissingImports]
-from sensor_msgs.msg import CompressedImage  # pyright: ignore[reportMissingImports]
-from tf2_ros import Buffer, TransformListener, TransformBroadcaster, TransformException  # pyright: ignore[reportMissingImports]
+from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import TransformStamped
+from nav2_msgs.action import NavigateToPose
+from sensor_msgs.msg import CompressedImage
+from tf2_ros import Buffer, TransformListener, TransformBroadcaster, TransformException
 
-from tracker_interfaces_team_9.msg import TrackerReport  # pyright: ignore[reportMissingImports]
+from tracker_interfaces_team_9.msg import TrackerReport
 
 
 def wrap_angle(angle):
@@ -33,16 +33,21 @@ def quaternion_yaw(q):
 
 
 def robot_id(namespace):
-    """Convert tb402 to ID 2, tb407 to ID 7, etc."""
-    if not namespace.startswith("tb") or not namespace[2:].isdigit():
-        raise ValueError("Robot names must look like tb402 or tb407")
+    """Convert tb402 to ID 2, tb407 to ID 7, or fallback gracefully for simulation."""
+    clean = namespace.strip("/").lower()
+    
+    # Official TurtleBot 4 competition convention (tb401 -> 1, tb402 -> 2, etc.)
+    if clean.startswith("tb") and clean[2:].isdigit():
+        val = int(clean[2:]) - 400
+        if 1 <= val <= 255:
+            return val
 
-    value = int(namespace[2:]) - 400
+    # Graceful fallback for TurtleBot 3 simulation (tb3_0 -> 0, tb3_1 -> 1, etc.)
+    digits = "".join(filter(str.isdigit, clean))
+    if digits:
+        return int(digits) % 256
 
-    if not 1 <= value <= 255:
-        raise ValueError("Robot ID must fit uint8: tb401 maps to ID 1")
-
-    return value
+    return 1
 
 
 class TrackerTwoTB4(Node):
@@ -53,6 +58,10 @@ class TrackerTwoTB4(Node):
             "chaser": "tb402",
             "enemy": "tb407",
             "global_frame": "map",
+            "chaser_base_frame": "",
+            "enemy_base_frame": "",
+            "camera_topic": "",
+            "nav_action_topic": "",
             "enemy_offset": 0.5,
             "enemy_fov": 80.0,
             "enemy_fov_offset": 30.0,
@@ -63,30 +72,17 @@ class TrackerTwoTB4(Node):
         for name, value in defaults.items():
             self.declare_parameter(name, value)
 
-        self.chaser = str(
-            self.get_parameter("chaser").value
-        ).strip("/")
-
-        self.enemy = str(
-            self.get_parameter("enemy").value
-        ).strip("/")
-
-        self.global_frame = str(
-            self.get_parameter("global_frame").value
-        ).strip("/")
+        self.chaser = str(self.get_parameter("chaser").value).strip("/")
+        self.enemy = str(self.get_parameter("enemy").value).strip("/")
+        self.global_frame = str(self.get_parameter("global_frame").value).strip("/")
 
         self.my_id = robot_id(self.chaser)
         self.opp_id = robot_id(self.enemy)
 
         if self.chaser == self.enemy or not self.global_frame:
-            raise ValueError(
-                "Use different robots and a non-empty global_frame"
-            )
+            raise ValueError("Use different robots and a non-empty global_frame")
 
-        self.enemy_offset = float(
-            self.get_parameter("enemy_offset").value
-        )
-
+        self.enemy_offset = float(self.get_parameter("enemy_offset").value)
         fov = float(self.get_parameter("enemy_fov").value)
         buffer = float(self.get_parameter("enemy_fov_offset").value)
 
@@ -94,13 +90,8 @@ class TrackerTwoTB4(Node):
         self.exclusion_angle = math.radians(fov / 2.0 + buffer)
         self.camera_half_fov = math.radians(fov / 2.0)
 
-        self.cooldown = float(
-            self.get_parameter("capture_cooldown").value
-        )
-
-        self.distance_tolerance = float(
-            self.get_parameter("capture_distance_tolerance").value
-        )
+        self.cooldown = float(self.get_parameter("capture_cooldown").value)
+        self.distance_tolerance = float(self.get_parameter("capture_distance_tolerance").value)
 
         if not (
             self.enemy_offset > 0.0
@@ -110,12 +101,30 @@ class TrackerTwoTB4(Node):
             and self.cooldown >= 5.0
             and 0.0 < self.distance_tolerance < self.enemy_offset
         ):
-            raise ValueError(
-                "Invalid tracker geometry or cooldown parameters"
-            )
+            raise ValueError("Invalid tracker geometry or cooldown parameters")
 
-        self.chaser_base = f"{self.chaser}/base_link"
-        self.enemy_base = f"{self.enemy}/base_link"
+        # Resolve TF base frame names with parameter overrides
+        chaser_base_param = str(self.get_parameter("chaser_base_frame").value).strip().strip("/")
+        enemy_base_param = str(self.get_parameter("enemy_base_frame").value).strip().strip("/")
+
+        self.chaser_base = chaser_base_param if chaser_base_param else f"{self.chaser}/base_link"
+        self.enemy_base = enemy_base_param if enemy_base_param else f"{self.enemy}/base_link"
+
+        # Resolve camera topic
+        camera_param = str(self.get_parameter("camera_topic").value).strip()
+        camera_topic = (
+            camera_param
+            if camera_param
+            else f"/{self.chaser}/oakd/rgb/preview/image_raw/compressed"
+        )
+
+        # Resolve navigation action topic
+        nav_param = str(self.get_parameter("nav_action_topic").value).strip()
+        nav_action_topic = (
+            nav_param
+            if nav_param
+            else f"/{self.chaser}/navigate_to_pose"
+        )
 
         # Keep recent images so TF can catch up to their timestamps.
         self.images = deque(maxlen=30)
@@ -126,7 +135,7 @@ class TrackerTwoTB4(Node):
 
         self.image_sub = self.create_subscription(
             CompressedImage,
-            f"/{self.chaser}/oakd/rgb/preview/image_raw/compressed",
+            camera_topic,
             self.tracker_image_callback,
             qos_profile_sensor_data,
         )
@@ -146,7 +155,7 @@ class TrackerTwoTB4(Node):
         self.nav_client = ActionClient(
             self,
             NavigateToPose,
-            f"/{self.chaser}/navigate_to_pose",
+            nav_action_topic,
         )
 
         self.goal_handle = None
@@ -165,7 +174,7 @@ class TrackerTwoTB4(Node):
         self.timer = self.create_timer(0.2, self.update_goal)  # 5 Hz
 
         self.get_logger().info(
-            f"Tracking {self.enemy} with {self.chaser}"
+            f"Tracker initialized: Chaser frame '{self.chaser_base}' -> Enemy frame '{self.enemy_base}'"
         )
 
     def now_seconds(self):
@@ -186,7 +195,6 @@ class TrackerTwoTB4(Node):
 
         if stamp != 0.0:
             age = self.now_seconds() - stamp
-
             if not -0.1 <= age <= 1.0:
                 raise ValueError(f"Stale TF for {frame}")
 
@@ -212,16 +220,13 @@ class TrackerTwoTB4(Node):
         dy = cy - ey
 
         distance = math.hypot(dx, dy)
-        angle = wrap_angle(
-            math.atan2(dy, dx) - enemy_yaw
-        )
+        angle = wrap_angle(math.atan2(dy, dx) - enemy_yaw)
 
         outside_fov = abs(angle) > self.exclusion_angle
 
         if (
             outside_fov
-            and abs(distance - self.enemy_offset)
-            <= self.distance_tolerance
+            and abs(distance - self.enemy_offset) <= self.distance_tolerance
         ):
             # At capture distance: hold position and face the opponent.
             return cx, cy, math.atan2(ey - cy, ex - cx)
@@ -231,10 +236,8 @@ class TrackerTwoTB4(Node):
                 math.pi,
                 self.exclusion_angle + math.radians(15.0),
             )
-
         elif not outside_fov:
             side = 1.0 if angle >= 0.0 else -1.0
-
             angle = side * min(
                 math.pi,
                 self.exclusion_angle + math.radians(10.0),
@@ -244,7 +247,6 @@ class TrackerTwoTB4(Node):
         gy = ey + self.enemy_offset * math.sin(enemy_yaw + angle)
 
         goal_yaw = math.atan2(ey - gy, ex - gx)
-
         return gx, gy, goal_yaw
 
     def broadcast_goal(self, goal):
@@ -295,7 +297,6 @@ class TrackerTwoTB4(Node):
 
         if self.last_goal is not None:
             lx, ly, lyaw = self.last_goal
-
             changed = (
                 math.hypot(goal[0] - lx, goal[1] - ly) > 0.15
                 or abs(wrap_angle(goal[2] - lyaw)) > 0.2
@@ -335,16 +336,13 @@ class TrackerTwoTB4(Node):
 
         try:
             future = self.nav_client.send_goal_async(msg)
-
             future.add_done_callback(
                 lambda result: self.goal_response_callback(result, goal)
             )
 
         except Exception as error:
             self.pending_goal = False
-            self.get_logger().error(
-                f"Could not send goal: {error}"
-            )
+            self.get_logger().error(f"Could not send goal: {error}")
 
     def goal_response_callback(self, future, goal):
         self.pending_goal = False
@@ -360,15 +358,12 @@ class TrackerTwoTB4(Node):
             self.last_goal = goal
 
             result = handle.get_result_async()
-
             result.add_done_callback(
                 lambda done: self.goal_result_callback(done, handle)
             )
 
         except Exception as error:
-            self.get_logger().error(
-                f"Goal response failed: {error}"
-            )
+            self.get_logger().error(f"Goal response failed: {error}")
 
     def cancel_current_goal(self):
         if self.goal_handle is None or self.cancel_pending:
@@ -387,9 +382,7 @@ class TrackerTwoTB4(Node):
 
         except Exception as error:
             self.cancel_pending = False
-            self.get_logger().error(
-                f"Cancellation request failed: {error}"
-            )
+            self.get_logger().error(f"Cancellation request failed: {error}")
 
     def cancel_response_callback(self, future, handle):
         if handle is not self.goal_handle:
@@ -400,19 +393,15 @@ class TrackerTwoTB4(Node):
 
             if response is None or not response.goals_canceling:
                 self.cancel_pending = False
-
                 self.get_logger().warning(
                     "Cancellation not accepted; waiting for goal result"
                 )
 
         except Exception as error:
             self.cancel_pending = False
-            self.get_logger().error(
-                f"Cancellation response failed: {error}"
-            )
+            self.get_logger().error(f"Cancellation response failed: {error}")
 
     def goal_result_callback(self, future, handle):
-        # Ignore a result belonging to an older goal.
         if handle is not self.goal_handle:
             return
 
@@ -425,9 +414,7 @@ class TrackerTwoTB4(Node):
 
         except Exception as error:
             self.goal_succeeded = False
-            self.get_logger().error(
-                f"Goal result failed: {error}"
-            )
+            self.get_logger().error(f"Goal result failed: {error}")
             return
 
         self.goal_succeeded = status == GoalStatus.STATUS_SUCCEEDED
@@ -435,28 +422,18 @@ class TrackerTwoTB4(Node):
         if self.goal_succeeded:
             self.success_time = self.now_seconds()
             self.use_alternative = False
-
-            self.get_logger().info(
-                "Goal reached; waiting for a valid capture image"
-            )
+            self.get_logger().info("Goal reached; waiting for a valid capture image")
 
         elif status == GoalStatus.STATUS_ABORTED:
             self.alternative_side *= -1.0
             self.use_alternative = True
-
-            self.get_logger().warning(
-                "Goal aborted; trying another allowed position"
-            )
+            self.get_logger().warning("Goal aborted; trying another allowed position")
 
         elif status == GoalStatus.STATUS_CANCELED:
-            self.get_logger().info(
-                "Old goal cancelled; updating target"
-            )
+            self.get_logger().info("Old goal cancelled; updating target")
 
         else:
-            self.get_logger().warning(
-                f"Goal finished with status {status}"
-            )
+            self.get_logger().warning(f"Goal finished with status {status}")
 
     def publish_report_if_ready(self):
         now = self.now_seconds()
@@ -471,7 +448,6 @@ class TrackerTwoTB4(Node):
             stamp = Time.from_msg(image.header.stamp)
             image_time = stamp.nanoseconds / 1e9
 
-            # Use a fresh image taken after the navigation goal succeeded.
             if image_time <= 0.0 or image_time < self.success_time:
                 continue
 
@@ -504,44 +480,30 @@ class TrackerTwoTB4(Node):
             bearing = math.atan2(relative.y, relative.x)
             enemy_bearing = math.atan2(reverse.y, reverse.x)
 
-            if (
-                abs(distance - self.enemy_offset)
-                > self.distance_tolerance
-            ):
+            if abs(distance - self.enemy_offset) > self.distance_tolerance:
                 continue
 
-            # Reject capture from inside the opponent's excluded region.
             if abs(enemy_bearing) <= self.exclusion_angle:
                 continue
 
-            # The opponent must be in front of the chaser's camera.
             if abs(bearing) > self.camera_half_fov:
                 continue
 
             report = TrackerReport()
-
-            report.header.stamp = image.header.stamp
-            report.header.frame_id = self.chaser_base
             report.image = image
-
             report.my_id = self.my_id
             report.opp_id = self.opp_id
             report.rel_dist = float(distance)
-
             report.rel_orient = float(
-                math.degrees(
-                    quaternion_yaw(enemy_tf.transform.rotation)
-                )
+                math.degrees(quaternion_yaw(enemy_tf.transform.rotation))
             )
 
             self.report_pub.publish(report)
             self.report_image_pub.publish(image)
 
             self.last_report_time = now
-
             self.get_logger().info(
-                f"Published report: opponent {self.opp_id}, "
-                f"distance {distance:.2f} m"
+                f"Published report: opponent {self.opp_id}, distance {distance:.2f} m"
             )
             return
 
@@ -561,13 +523,7 @@ def main(args=None):
         if node is not None:
             if rclpy.ok() and node.goal_handle is not None:
                 future = node.goal_handle.cancel_goal_async()
-
-                rclpy.spin_until_future_complete(
-                    node,
-                    future,
-                    timeout_sec=1.0,
-                )
-
+                rclpy.spin_until_future_complete(node, future, timeout_sec=1.0)
             node.destroy_node()
 
         if rclpy.ok():
