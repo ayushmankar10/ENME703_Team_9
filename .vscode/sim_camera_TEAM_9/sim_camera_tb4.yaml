@@ -1,0 +1,17 @@
+/tb402/sim_camera:
+  ros__parameters:
+    use_sim_time: true
+
+    chaser_base_frame: "tb402/base_link"
+    enemy_base_frame: "tb407/base_link"
+
+    image_topic: "/tb402/synthetic_camera/image_raw/compressed"
+
+    rate_hz: 10.0
+    width: 320
+    height: 240
+    hfov_deg: 80.0
+    max_range: 4.0
+    robot_width: 0.35
+    max_tf_age: 1.0
+    
