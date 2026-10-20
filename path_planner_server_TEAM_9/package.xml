@@ -3,7 +3,7 @@
 <package format="3">
   <name>path_planner_server_TEAM_9</name>
   <version>0.0.0</version>
-  <description>Namespaced Nav2 navigation for Team 9 TurtleBot 4 robots.</description>
+  <description>Namespaced Nav2 navigation and simulation launch for Team 9 robots.</description>
   <maintainer email="karayushman963@gmail.com">Ayushman Kar</maintainer>
   <license>TODO: License declaration</license>
 
@@ -11,6 +11,11 @@
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>ros2launch</exec_depend>
+
+  <exec_depend>localization_server_TEAM_9</exec_depend>
+  <exec_depend>nav2_amcl</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>rviz2</exec_depend>
 
   <exec_depend>nav2_planner</exec_depend>
   <exec_depend>nav2_controller</exec_depend>

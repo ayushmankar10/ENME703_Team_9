@@ -2,8 +2,8 @@
 <package format="3">
   <name>tracker_TEAM_9</name>
   <version>0.0.0</version>
-  <description>Two TurtleBot 4 tracking node for Team 9.</description>
-  <maintainer email="user@todo.todo">user</maintainer>
+  <description>TF-based opponent pursuit and capture reporting for Team 9 robots.</description>
+  <maintainer email="karayushman963@gmail.com">Ayushman Kar</maintainer>
   <license>TODO: License declaration</license>
 
   <exec_depend>rclpy</exec_depend>
@@ -13,14 +13,10 @@
   <exec_depend>ros2launch</exec_depend>
 
   <exec_depend>tf2_ros</exec_depend>
-  <exec_depend>tf_transformations</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
-  <exec_depend>nav_msgs</exec_depend>
   <exec_depend>nav2_msgs</exec_depend>
   <exec_depend>action_msgs</exec_depend>
-  <exec_depend>python3-numpy</exec_depend>
-  <exec_depend>python3-scipy</exec_depend>
   <exec_depend>tracker_interfaces_team_9</exec_depend>
 
   <export>
